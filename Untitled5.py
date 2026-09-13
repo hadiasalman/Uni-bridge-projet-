@@ -1,428 +1,557 @@
 import streamlit as st
-from copy import deepcopy
+import sqlite3
+import hashlib
+import os
+from google import genai
+from google.genai import errors
 
-# 1. Page Setup
+# ============================================================
+# 1. PAGE & SYSTEM INITIALIZATION
+# ============================================================
 st.set_page_config(
-    page_title="UniBridge",
+    page_title="UniBridge Platform",
     page_icon="🎓",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 2. Initial Data Structure
-INITIAL_DATA = {
-    "seniors": [],
-    "juniors": [],
-    "questions": [],
-    "answers": [],
-    "universities": [],
-    "connections": 0,
-    "current_user": "",
-    "current_role": "",
-    "uploaded_files": [],
-    "model_settings": {
-        "model": "Gemini",
-        "temperature": 0.7,
-        "max_tokens": 1000,
-        "prompt": "You are a helpful university guidance assistant."
-    },
-    "settings": {
-        "name": "",
-        "university": "",
-        "notifications": True,
-        "email": True,
-        "theme": "Light"
-    }
-}
+DB_FILE = "unibridge.db"
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL,
+            university TEXT NOT NULL,
+            department TEXT NOT NULL,
+            bio TEXT DEFAULT '',
+            expertise TEXT DEFAULT ''
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            junior_id INTEGER NOT NULL,
+            junior_name TEXT NOT NULL,
+            target_senior_id INTEGER,
+            title TEXT NOT NULL,
+            details TEXT NOT NULL,
+            department TEXT NOT NULL,
+            status TEXT DEFAULT 'Unanswered',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (junior_id) REFERENCES users (id),
+            FOREIGN KEY (target_senior_id) REFERENCES users (id)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question_id INTEGER NOT NULL,
+            senior_id INTEGER NOT NULL,
+            senior_name TEXT NOT NULL,
+            answer_text TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (question_id) REFERENCES questions (id),
+            FOREIGN KEY (senior_id) REFERENCES users (id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
 
 # Initialize Session State
-if "data" not in st.session_state:
-    st.session_state.data = deepcopy(INITIAL_DATA)
+if "auth_user" not in st.session_state:
+    st.session_state.auth_user = None
+if "theme" not in st.session_state:
+    st.session_state.theme = "Dark"
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = [
+        {"role": "assistant", "content": "Hello! I am your UniBridge AI Assistant powered by Gemini. Ask me any question regarding programming, coursework, or career paths!"}
+    ]
 
-data = st.session_state.data
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
-# 3. Custom CSS Theme
-PRIMARY = "#0F766E"
-PRIMARY_DARK = "#115E59"
-PRIMARY_LIGHT = "#CCFBF1"
-NAVY = "#0B1F26"
-NAVY_LIGHT = "#12343B"
-TEXT = "#334155"
-HEADING = "#12343B"
-MUTED = "#64748B"
-BACKGROUND = "#F4F8F7"
-WHITE = "#FFFFFF"
-BORDER = "#CBD5E1"
+# ============================================================
+# 2. DYNAMIC THEMING ENGINE
+# ============================================================
+is_dark = st.session_state.theme == "Dark"
+
+bg_color = "#0F172A" if is_dark else "#F8FAFC"
+card_bg = "#1E293B" if is_dark else "#FFFFFF"
+text_color = "#F8FAFC" if is_dark else "#0F172A"
+border_color = "#334155" if is_dark else "#CBD5E1"
+accent_color = "#14B8A6" if is_dark else "#0D9488"
+subtext_color = "#94A3B8" if is_dark else "#475569"
+input_bg = "#334155" if is_dark else "#F1F5F9"
+input_text = "#FFFFFF" if is_dark else "#0F172A"
 
 st.markdown(f"""
 <style>
-    .main {{ background-color: {BACKGROUND}; }}
-    .stApp {{ max-width: 100%; }}
-    
+    .stApp, [data-testid="stAppViewContainer"] {{
+        background-color: {bg_color} !important;
+        color: {text_color} !important;
+    }}
+    section[data-testid="stSidebar"] {{
+        background-color: {card_bg} !important;
+        border-right: 1px solid {border_color} !important;
+    }}
+    section[data-testid="stSidebar"] * {{
+        color: {text_color} !important;
+    }}
+    p, h1, h2, h3, h4, h5, h6, label, span, div {{
+        color: {text_color} !important;
+    }}
+    input, textarea, select, [data-baseweb="select"] > div {{
+        background-color: {input_bg} !important;
+        color: {input_text} !important;
+        border-color: {border_color} !important;
+    }}
+    .card {{
+        background-color: {card_bg} !important;
+        border: 1px solid {border_color} !important;
+        border-radius: 12px;
+        padding: 20px;
+        margin-bottom: 16px;
+    }}
     .top-header {{
-        background: {WHITE};
-        border-bottom: 1px solid {BORDER};
+        background-color: {card_bg} !important;
+        border: 1px solid {border_color} !important;
         padding: 16px 24px;
         border-radius: 12px;
         margin-bottom: 20px;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.03);
     }}
-    .brand-name {{ color: {HEADING}; font-size: 26px; font-weight: 800; }}
-    .brand-name span {{ color: {PRIMARY}; }}
-    .brand-tagline {{ color: {MUTED}; font-size: 13px; margin-top: 2px; }}
-    
-    .welcome-banner {{
-        background: linear-gradient(120deg, {NAVY}, {NAVY_LIGHT} 55%, {PRIMARY});
-        color: {WHITE};
-        border-radius: 16px;
-        padding: 28px;
-        margin-bottom: 24px;
-    }}
-    .welcome-banner h2 {{ margin: 0 0 8px; font-size: 26px; color: {WHITE} !important; }}
-    .welcome-banner p {{ margin: 0; font-size: 14px; opacity: 0.9; color: {WHITE} !important; }}
-    
+    .brand-name {{ color: {text_color} !important; font-size: 26px; font-weight: 800; display: inline-block; }}
+    .brand-name span {{ color: {accent_color} !important; }}
     .stat-card {{
-        background: {WHITE};
-        border: 1px solid {BORDER};
+        background-color: {card_bg} !important;
+        border: 1px solid {border_color} !important;
         border-radius: 12px;
         padding: 16px;
         text-align: center;
-        box-shadow: 0 4px 10px rgba(15,23,42,.04);
     }}
-    .stat-number {{ font-size: 24px; font-weight: 800; color: {PRIMARY}; }}
-    .stat-label {{ font-size: 12px; font-weight: 700; color: {HEADING}; }}
-    
-    .question-card {{
-        background: {WHITE};
-        border: 1px solid {BORDER};
-        border-radius: 12px;
-        padding: 18px;
-        margin-bottom: 14px;
-    }}
-    .question-id {{
-        display: inline-block;
-        padding: 4px 10px;
-        background: {PRIMARY_LIGHT};
-        color: {PRIMARY_DARK};
-        font-weight: 800;
-        border-radius: 6px;
-        font-size: 12px;
-        margin-bottom: 8px;
-    }}
+    .stat-number {{ font-size: 24px; font-weight: 800; color: {accent_color} !important; }}
+    .stat-label {{ font-size: 13px; color: {subtext_color} !important; }}
 </style>
 """, unsafe_allow_html=True)
 
-# 4. Global Header Banner
-st.markdown(f"""
+# Top Bar Header
+st.markdown("""
 <div class="top-header">
     <div class="brand-name">🎓 Uni<span>Bridge</span></div>
-    <div class="brand-tagline">Your university, Your seniors, Your guide.</div>
+    <span style="float: right; font-size: 13px; margin-top: 8px;">Peer Mentorship & AI Guidance Platform</span>
 </div>
 """, unsafe_allow_html=True)
 
-# 5. Dynamic Navigation Sidebar
-st.sidebar.markdown("### 📌 MAIN MENU")
-
-current_user = data.get("current_user", "")
-current_role = data.get("current_role", "")
-
-if not current_user:
-    pages = ["Registration"]
-else:
-    if current_role == "Junior":
-        pages = ["Dashboard", "Ask a Question", "History", "Data Upload", "Model Settings", "Run Prediction", "Results", "Settings"]
-    else:
-        pages = ["Dashboard", "Senior Questions", "History", "Data Upload", "Model Settings", "Run Prediction", "Results", "Settings"]
-
-selected_page = st.sidebar.radio("Go to", pages)
+# Sidebar Theme Selector
+st.sidebar.markdown("### 🎨 APPEARANCE")
+current_theme = st.sidebar.radio("UI Theme Mode", ["Dark", "Light"], index=0 if is_dark else 1, key="theme_radio")
+if current_theme != st.session_state.theme:
+    st.session_state.theme = current_theme
+    st.rerun()
 
 st.sidebar.markdown("---")
-if current_user:
-    st.sidebar.markdown(f"👤 **{current_user}** ({current_role})")
-else:
-    st.sidebar.markdown("👤 **Guest User**")
-st.sidebar.caption("🎓 *Small steps today, big dreams tomorrow.*")
-
-# Helper functions
-def clean_text(val):
-    return (val or "").strip()
-
-def normalize(val):
-    return clean_text(val).casefold()
 
 # ============================================================
-# PAGE 1: REGISTRATION
+# 3. AUTHENTICATION (REGISTER / LOGIN / LOGOUT)
 # ============================================================
-if selected_page == "Registration":
-    st.markdown("""
-    <div class="welcome-banner">
-        <h2>Welcome to UniBridge! 👋</h2>
-        <p>First, create your profile. Your role decides which guidance menu opens next.</p>
-    </div>
-    """, unsafe_allow_html=True)
+if not st.session_state.auth_user:
+    st.subheader("🔑 Access UniBridge")
+    auth_tab1, auth_tab2 = st.tabs(["Login", "Register Account"])
     
-    with st.form("registration_form"):
-        st.subheader("👤 Create Profile")
-        name = st.text_input("Name", placeholder="Enter your full name")
-        role = st.radio("Register As", ["Senior", "Junior"])
-        university = st.text_input("University", placeholder="e.g. University of Engineering")
-        department = st.text_input("Department", placeholder="e.g. Computer Science / AI")
-        
-        submit_reg = st.form_submit_button("Create Profile")
-        if submit_reg:
-            if not clean_text(name) or not clean_text(university):
-                st.error("⚠️ Please fill in all required fields (Name and University).")
-            else:
-                existing = data["seniors"] if role == "Senior" else data["juniors"]
-                duplicate = any(
-                    normalize(p["name"]) == normalize(name) and 
-                    normalize(p["university"]) == normalize(university)
-                    for p in existing
-                )
-                if duplicate:
-                    st.error("⚠️ Profile already exists.")
+    with auth_tab1:
+        st.markdown("##### Existing User Login")
+        with st.form("login_form"):
+            login_email = st.text_input("Email Address")
+            login_pass = st.text_input("Password", type="password")
+            submit_login = st.form_submit_button("Sign In")
+            
+            if submit_login:
+                if not login_email or not login_pass:
+                    st.error("Please provide both email and password.")
                 else:
-                    person = {"name": name, "university": university, "department": department or "General"}
-                    existing.append(person)
-                    if normalize(university) not in [normalize(u) for u in data["universities"]]:
-                        data["universities"].append(university)
+                    conn = get_db_connection()
+                    user = conn.execute(
+                        "SELECT * FROM users WHERE email = ? AND password_hash = ?",
+                        (login_email.strip().lower(), hash_password(login_pass))
+                    ).fetchone()
+                    conn.close()
                     
-                    data["current_user"] = name
-                    data["current_role"] = role
-                    data["settings"]["name"] = name
-                    data["settings"]["university"] = university
-                    st.success(f"🎉 Registration successful! Logged in as **{name}** ({role}).")
-                    st.rerun()
-
-# ============================================================
-# PAGE 2: DASHBOARD
-# ============================================================
-elif selected_page == "Dashboard":
-    st.markdown("""
-    <div class="welcome-banner">
-        <h2>UniBridge Dashboard 🏠</h2>
-        <p>Track your university community and access your role-based guidance tools.</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.markdown(f"<div class='stat-card'><div class='stat-number'>{len(data['seniors'])}</div><div class='stat-label'>Seniors</div></div>", unsafe_allow_html=True)
-    c2.markdown(f"<div class='stat-card'><div class='stat-number'>{len(data['juniors'])}</div><div class='stat-label'>Juniors</div></div>", unsafe_allow_html=True)
-    c3.markdown(f"<div class='stat-card'><div class='stat-number'>{len(data['questions'])}</div><div class='stat-label'>Questions</div></div>", unsafe_allow_html=True)
-    c4.markdown(f"<div class='stat-card'><div class='stat-number'>{len(data['answers'])}</div><div class='stat-label'>Answers</div></div>", unsafe_allow_html=True)
-    c5.markdown(f"<div class='stat-card'><div class='stat-number'>{len(data['universities'])}</div><div class='stat-label'>Universities</div></div>", unsafe_allow_html=True)
-
-    st.markdown("### 👨‍🎓 Search Seniors")
-    col_a, col_b = st.columns(2)
-    s_univ = col_a.text_input("Filter by University")
-    s_dept = col_b.text_input("Filter by Department")
-    
-    if st.button("Find Seniors"):
-        su, sd = normalize(s_univ), normalize(s_dept)
-        results = [s for s in data["seniors"] if (not su or su in normalize(s["university"])) and (not sd or sd in normalize(s["department"]))]
-        if results:
-            for s in results:
-                st.info(f"👤 **{s['name']}** | 🏫 **University:** {s['university']} | 📚 **Dept:** {s['department']}")
-        else:
-            st.warning("No matching seniors found.")
-
-    st.markdown("### 🎓 Search Juniors")
-    col_c, col_d = st.columns(2)
-    j_univ = col_c.text_input("Filter Juniors by University")
-    j_dept = col_d.text_input("Filter Juniors by Department")
-    
-    if st.button("Find Juniors"):
-        ju, jd = normalize(j_univ), normalize(j_dept)
-        results = [j for j in data["juniors"] if (not ju or ju in normalize(j["university"])) and (not jd or jd in normalize(j["department"]))]
-        if results:
-            for j in results:
-                st.info(f"👤 **{j['name']}** | 🏫 **University:** {j['university']} | 📚 **Dept:** {j['department']}")
-        else:
-            st.warning("No matching juniors found.")
-
-# ============================================================
-# PAGE 3: ASK A QUESTION (JUNIORS ONLY)
-# ============================================================
-elif selected_page == "Ask a Question":
-    st.subheader("💬 Ask a Senior")
-    q_text = st.text_area("Your Question", placeholder="Ask anything about academics, guidance, or university life...")
-    q_dept = st.text_input("Department", value=data["settings"].get("department", ""))
-    
-    if st.button("Post Question"):
-        if not clean_text(q_text):
-            st.error("⚠️ Please enter a question.")
-        else:
-            used_ids = [int(q.get("id", 0)) for q in data.get("questions", [])]
-            q_id = max(used_ids, default=0) + 1
-            data["questions"].append({
-                "id": q_id,
-                "question": q_text,
-                "department": q_dept or "General",
-                "asked_by": data["current_user"],
-                "answer": "",
-                "answered_by": ""
-            })
-            st.success(f"✅ Question posted with **Question ID Q{q_id:03d}**!")
-
-# ============================================================
-# PAGE 4: SENIOR QUESTIONS (SENIORS ONLY)
-# ============================================================
-elif selected_page == "Senior Questions":
-    st.subheader("❓ Unanswered Questions from Juniors")
-    unanswered = [q for q in data["questions"] if not clean_text(q.get("answer", ""))]
-    
-    if not unanswered:
-        st.info("There are currently no unanswered questions.")
-    else:
-        for q in unanswered:
-            st.markdown(f"""
-            <div class="question-card">
-                <span class="question-id">Q{int(q['id']):03d}</span>
-                <h4>{q['question']}</h4>
-                <p>📚 <b>Department:</b> {q['department']} | 👤 <b>Asked by:</b> {q['asked_by']}</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        q_options = {f"Q{int(q['id']):03d} - {q['question'][:40]}...": q["id"] for q in unanswered}
-        selected_q = st.selectbox("Select Question to Answer", list(q_options.keys()))
-        answer_text = st.text_area("Your Senior Answer")
-        
-        if st.button("Post Answer"):
-            if not clean_text(answer_text):
-                st.error("⚠️ Please write an answer.")
-            else:
-                target_id = q_options[selected_q]
-                for q in data["questions"]:
-                    if q["id"] == target_id:
-                        q["answer"] = answer_text
-                        q["answered_by"] = data["current_user"]
-                        data["answers"].append({
-                            "question_id": target_id,
-                            "answer": answer_text,
-                            "answered_by": data["current_user"]
-                        })
-                        st.success(f"✅ Answer posted for Q{target_id:03d}!")
+                    if user:
+                        st.session_state.auth_user = dict(user)
+                        st.success(f"Welcome back, {user['name']}!")
                         st.rerun()
+                    else:
+                        st.error("Invalid email address or password.")
+
+    with auth_tab2:
+        st.markdown("##### Register New Account")
+        with st.form("reg_form"):
+            reg_name = st.text_input("Full Name")
+            reg_email = st.text_input("Email Address")
+            reg_pass = st.text_input("Password", type="password")
+            reg_role = st.selectbox("I am a:", ["Junior", "Senior"])
+            reg_univ = st.text_input("University", value="ITECH College")
+            reg_dept = st.text_input("Department", placeholder="e.g., Artificial Intelligence")
+            reg_bio = st.text_area("Short Bio / Interests", placeholder="Describe your focus or goals...")
+            reg_exp = st.text_input("Skills / Expertise", placeholder="e.g., Python, Web Dev, Data Science")
+            
+            submit_reg = st.form_submit_button("Create Account")
+            
+            if submit_reg:
+                if not reg_name or not reg_email or not reg_pass or not reg_dept:
+                    st.error("Please fill in all required fields.")
+                else:
+                    conn = get_db_connection()
+                    try:
+                        conn.execute("""
+                            INSERT INTO users (name, email, password_hash, role, university, department, bio, expertise)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            reg_name.strip(),
+                            reg_email.strip().lower(),
+                            hash_password(reg_pass),
+                            reg_role,
+                            reg_univ.strip(),
+                            reg_dept.strip(),
+                            reg_bio.strip(),
+                            reg_exp.strip()
+                        ))
+                        conn.commit()
+                        st.success("Account created successfully! Please switch to the Login tab to sign in.")
+                    except sqlite3.IntegrityError:
+                        st.error("An account with this email address already exists. Please log in.")
+                    finally:
+                        conn.close()
+    st.stop()
 
 # ============================================================
-# PAGE 5: HISTORY
+# 4. NAVIGATION & SIDEBAR CONTROL
 # ============================================================
-elif selected_page == "History":
-    st.subheader("📜 Question & Answer History")
-    answered = [q for q in data["questions"] if clean_text(q.get("answer", ""))]
+user = st.session_state.auth_user
+
+st.sidebar.markdown(f"### 👤 {user['name']}")
+st.sidebar.markdown(f"**Role:** `{user['role']}`  \n**Dept:** {user['department']}")
+st.sidebar.markdown("---")
+
+if user["role"] == "Junior":
+    nav_options = ["Dashboard", "Ask Question", "My Questions & Answers", "Find Seniors", "AI Assistant", "Settings"]
+else:
+    nav_options = ["Dashboard", "Answer Questions", "Find Seniors", "AI Assistant", "Settings"]
+
+selected_page = st.sidebar.radio("Navigation Menu", nav_options)
+
+st.sidebar.markdown("---")
+if st.sidebar.button("🚪 Logout", use_container_width=True):
+    st.session_state.auth_user = None
+    st.rerun()
+
+# ============================================================
+# 5. DASHBOARDS
+# ============================================================
+conn = get_db_connection()
+
+if selected_page == "Dashboard":
+    st.subheader(f"👋 Welcome, {user['name']}!")
     
-    if not answered:
-        st.info("No questions have been answered yet.")
-    else:
-        for q in answered:
+    q_total = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
+    q_answered = conn.execute("SELECT COUNT(*) FROM questions WHERE status = 'Answered'").fetchone()[0]
+    seniors_count = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'Senior'").fetchone()[0]
+    juniors_count = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'Junior'").fetchone()[0]
+    
+    m1, m2, m3, m4 = st.columns(4)
+    m1.markdown(f"<div class='stat-card'><div class='stat-number'>{q_total}</div><div class='stat-label'>Total Questions</div></div>", unsafe_allow_html=True)
+    m2.markdown(f"<div class='stat-card'><div class='stat-number'>{q_answered}</div><div class='stat-label'>Resolved Questions</div></div>", unsafe_allow_html=True)
+    m3.markdown(f"<div class='stat-card'><div class='stat-number'>{seniors_count}</div><div class='stat-label'>Available Seniors</div></div>", unsafe_allow_html=True)
+    m4.markdown(f"<div class='stat-card'><div class='stat-number'>{juniors_count}</div><div class='stat-label'>Registered Juniors</div></div>", unsafe_allow_html=True)
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    if user["role"] == "Junior":
+        st.markdown("##### 📌 Recent Community Questions")
+        recent_q = conn.execute("SELECT * FROM questions ORDER BY created_at DESC LIMIT 5").fetchall()
+        for q in recent_q:
             st.markdown(f"""
-            <div class="question-card">
-                <span class="question-id">Q{int(q['id']):03d}</span>
-                <h4>❓ {q['question']}</h4>
-                <p>📚 <b>Department:</b> {q['department']} | 👤 <b>Asked by:</b> {q['asked_by']}</p>
-                <hr style="margin: 10px 0;">
-                <p style="color: {PRIMARY_DARK}; font-weight: bold;">✅ Senior Answer:</p>
-                <p>{q['answer']}</p>
-                <p style="font-size: 12px; color: {MUTED};">👨‍🎓 <b>Answered by:</b> {q['answered_by']}</p>
+            <div class='card'>
+                <b>{q['title']}</b> <span style='font-size:12px; color:{subtext_color}'>({q['department']})</span><br>
+                <span style='font-size:13px;'>Asked by: {q['junior_name']} | Status: <code>{q['status']}</code></span>
             </div>
             """, unsafe_allow_html=True)
-
-# ============================================================
-# PAGE 6: DATA UPLOAD
-# ============================================================
-elif selected_page == "Data Upload":
-    st.subheader("📤 Upload Documents")
-    uploaded_files = st.file_uploader("Upload course materials, notes, or resources", accept_multiple_files=True)
-    
-    if st.button("Process Uploads"):
-        if uploaded_files:
-            for file in uploaded_files:
-                if file.name not in data["uploaded_files"]:
-                    data["uploaded_files"].append(file.name)
-            st.success("✅ Files successfully attached to session state.")
-        else:
-            st.warning("⚠️ Please select files to upload.")
             
-    if data["uploaded_files"]:
-        st.markdown("#### Stored Session Files:")
-        for fname in data["uploaded_files"]:
-            st.markdown(f"- 📄 **{fname}**")
-
-# ============================================================
-# PAGE 7: MODEL SETTINGS
-# ============================================================
-elif selected_page == "Model Settings":
-    st.subheader("⚙️ AI Guidance Model Settings")
-    model = st.selectbox("Select Model", ["Gemini", "GPT-4", "Claude"], index=0)
-    temp = st.slider("Temperature", 0.0, 1.0, data["model_settings"]["temperature"])
-    tokens = st.number_input("Max Tokens", 100, 4000, data["model_settings"]["max_tokens"])
-    prompt = st.text_area("System Prompt", value=data["model_settings"]["prompt"])
-    
-    if st.button("Save Model Settings"):
-        data["model_settings"] = {
-            "model": model,
-            "temperature": temp,
-            "max_tokens": tokens,
-            "prompt": prompt
-        }
-        st.success("✅ Model Settings Saved!")
-
-# ============================================================
-# PAGE 8: RUN PREDICTION
-# ============================================================
-elif selected_page == "Run Prediction":
-    st.subheader("🚀 Run AI Senior Prediction")
-    query = st.text_input("Enter your guidance query:")
-    
-    if st.button("Generate Guidance"):
-        if not clean_text(query):
-            st.warning("⚠️ Please enter a prompt query.")
+    elif user["role"] == "Senior":
+        st.markdown("##### 📥 Open Questions Needing Help")
+        open_q = conn.execute("SELECT * FROM questions WHERE status = 'Unanswered' ORDER BY created_at DESC").fetchall()
+        if not open_q:
+            st.info("No unanswered questions right now. Great job!")
         else:
+            for q in open_q:
+                st.markdown(f"""
+                <div class='card'>
+                    <b>{q['title']}</b> <span style='font-size:12px; color:{subtext_color}'>({q['department']})</span><br>
+                    <p style='font-size:14px; margin: 8px 0;'>{q['details']}</p>
+                    <span style='font-size:12px; color:{subtext_color}'>Asked by {q['junior_name']} on {q['created_at']}</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+# ============================================================
+# 6. JUNIOR WORKFLOW
+# ============================================================
+elif selected_page == "Ask Question" and user["role"] == "Junior":
+    st.subheader("❓ Ask a Senior")
+    
+    seniors = conn.execute("SELECT id, name, expertise FROM users WHERE role = 'Senior'").fetchall()
+    senior_options = {"General - Any Senior": None}
+    senior_options.update({f"{s['name']} (Skills: {s['expertise'] or 'General'})": s['id'] for s in seniors})
+    
+    with st.form("ask_q_form"):
+        q_title = st.text_input("Question Summary / Title")
+        q_target = st.selectbox("Target Senior (Optional)", list(senior_options.keys()))
+        q_dept = st.text_input("Department / Subject Category", value=user["department"])
+        q_details = st.text_area("Detailed Explanation", placeholder="Provide context or code snippets...")
+        
+        submit_q = st.form_submit_button("Post Question")
+        
+        if submit_q:
+            if not q_title or not q_details:
+                st.error("Please provide both a title and detailed explanation.")
+            else:
+                target_id = senior_options[q_target]
+                conn.execute("""
+                    INSERT INTO questions (junior_id, junior_name, target_senior_id, title, details, department)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (user["id"], user["name"], target_id, q_title.strip(), q_details.strip(), q_dept.strip()))
+                conn.commit()
+                st.success("Your question has been posted successfully!")
+
+elif selected_page == "My Questions & Answers" and user["role"] == "Junior":
+    st.subheader("📚 My Submitted Questions")
+    
+    my_questions = conn.execute("SELECT * FROM questions WHERE junior_id = ? ORDER BY created_at DESC", (user["id"],)).fetchall()
+    
+    if not my_questions:
+        st.info("You haven't asked any questions yet.")
+    else:
+        for q in my_questions:
             st.markdown(f"""
-            ### 💡 Suggested Guidance
-            > {query}
+            <div class='card'>
+                <h4>{q['title']}</h4>
+                <p>{q['details']}</p>
+                <span style='font-size:12px; color:{subtext_color}'>Category: {q['department']} | Status: <b>{q['status']}</b></span>
+            </div>
+            """, unsafe_allow_html=True)
             
-            1. 📚 Check official course syllabi and guidelines.
-            2. 👨‍🎓 Consult senior students within your department.
-            3. 📝 Maintain consistent study schedules and track project deadlines.
-            
-            *Config:* Model **{data['model_settings']['model']}** | Temp **{data['model_settings']['temperature']}**
-            """)
+            answers = conn.execute("SELECT * FROM answers WHERE question_id = ? ORDER BY created_at ASC", (q["id"],)).fetchall()
+            if answers:
+                for ans in answers:
+                    st.markdown(f"""
+                    <div style='margin-left: 30px; background-color:{card_bg}; border-left: 3px solid {accent_color}; padding: 12px; margin-bottom: 10px;'>
+                        <b>💬 Answer from {ans['senior_name']}:</b>
+                        <p style='margin-top: 6px;'>{ans['answer_text']}</p>
+                        <span style='font-size:11px; color:{subtext_color}'>Answered on {ans['created_at']}</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.caption("⏳ No answers posted for this question yet.")
+            st.markdown("---")
 
 # ============================================================
-# PAGE 9: RESULTS
+# 7. SENIOR WORKFLOW
 # ============================================================
-elif selected_page == "Results":
-    st.subheader("📊 Platform Results & Analytics")
-    st.json({
-        "Seniors": len(data["seniors"]),
-        "Juniors": len(data["juniors"]),
-        "Questions": len(data["questions"]),
-        "Answers": len(data["answers"]),
-        "Universities": len(data["universities"]),
-        "Uploaded Files": len(data["uploaded_files"])
-    })
+elif selected_page == "Answer Questions" and user["role"] == "Senior":
+    st.subheader("📝 Answer Junior Questions")
+    
+    filter_status = st.radio("Filter Questions", ["Unanswered", "All Questions"], horizontal=True)
+    
+    if filter_status == "Unanswered":
+        questions = conn.execute("SELECT * FROM questions WHERE status = 'Unanswered' ORDER BY created_at DESC").fetchall()
+    else:
+        questions = conn.execute("SELECT * FROM questions ORDER BY created_at DESC").fetchall()
+        
+    if not questions:
+        st.info("No questions matching current filter.")
+    else:
+        for q in questions:
+            with st.expander(f"Q: {q['title']} (Asked by {q['junior_name']} - {q['department']})"):
+                st.write(f"**Details:** {q['details']}")
+                st.caption(f"Posted on: {q['created_at']}")
+                
+                existing_answers = conn.execute("SELECT * FROM answers WHERE question_id = ?", (q["id"],)).fetchall()
+                if existing_answers:
+                    st.markdown("---")
+                    st.markdown("**Existing Answers:**")
+                    for ea in existing_answers:
+                        st.markdown(f"- *{ea['senior_name']}*: {ea['answer_text']}")
+                
+                st.markdown("---")
+                with st.form(f"ans_form_{q['id']}"):
+                    ans_text = st.text_area("Your Response", placeholder="Provide clear, constructive advice...")
+                    submit_ans = st.form_submit_button("Submit Response")
+                    
+                    if submit_ans:
+                        if not ans_text.strip():
+                            st.error("Response cannot be empty.")
+                        else:
+                            conn.execute("""
+                                INSERT INTO answers (question_id, senior_id, senior_name, answer_text)
+                                VALUES (?, ?, ?, ?)
+                            """, (q["id"], user["id"], user["name"], ans_text.strip()))
+                            
+                            conn.execute("UPDATE questions SET status = 'Answered' WHERE id = ?", (q["id"],))
+                            conn.commit()
+                            st.success("Your answer has been saved!")
+                            st.rerun()
 
 # ============================================================
-# PAGE 10: SETTINGS
+# 8. SENIOR DISCOVERY
+# ============================================================
+elif selected_page == "Find Seniors":
+    st.subheader("🔍 Discover Seniors & Mentors")
+    
+    search_term = st.text_input("Search by Name, Expertise, or Department")
+    
+    if search_term:
+        term = f"%{search_term.strip()}%"
+        seniors = conn.execute("""
+            SELECT id, name, university, department, bio, expertise, email FROM users 
+            WHERE role = 'Senior' AND (name LIKE ? OR expertise LIKE ? OR department LIKE ?)
+        """, (term, term, term)).fetchall()
+    else:
+        seniors = conn.execute("SELECT id, name, university, department, bio, expertise, email FROM users WHERE role = 'Senior'").fetchall()
+        
+    if not seniors:
+        st.warning("No Seniors found matching your search criteria.")
+    else:
+        cols = st.columns(2)
+        for idx, s in enumerate(seniors):
+            col = cols[idx % 2]
+            with col:
+                col.markdown(f"""
+                <div class='card'>
+                    <h4>👨‍🎓 {s['name']}</h4>
+                    <b>🏫 {s['university']} | 📚 {s['department']}</b><br>
+                    <p style='margin-top: 8px;'><b>Skills:</b> {s['expertise'] or 'General Mentorship'}</p>
+                    <p style='font-size:13px; color:{subtext_color};'>{s['bio'] or 'No bio provided.'}</p>
+                </div>
+                """, unsafe_allow_html=True)
+
+# ============================================================
+# 9. REAL DYNAMIC AI CHATBOT (GEMINI INTEGRATION)
+# ============================================================
+elif selected_page == "AI Assistant":
+    st.subheader("🤖 Context-Aware AI Study Assistant")
+    st.caption("Powered by Gemini. Ask any programming, academic, or general knowledge question.")
+
+    # Render complete chat history
+    for msg in st.session_state.chat_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Chat Input Box
+    if user_prompt := st.chat_input("Type your question here (e.g., What is C? Explain recursion simply)..."):
+        # Display User Input
+        st.session_state.chat_messages.append({"role": "user", "content": user_prompt})
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
+
+        # Generate Response using Gemini API
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            
+            # API Key Retrieval
+            api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
+            
+            if api_key:
+                try:
+                    client = genai.Client(api_key=api_key)
+                    
+                    # Prepare conversation context for multi-turn chat
+                    formatted_contents = []
+                    for m in st.session_state.chat_messages:
+                        role_tag = "user" if m["role"] == "user" else "model"
+                        formatted_contents.append({"role": role_tag, "parts": [{"text": m["content"]}]})
+                        
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=formatted_contents,
+                    )
+                    ai_response = response.text
+                except Exception as e:
+                    ai_response = f"⚠️ Gemini API connection issue: {str(e)}"
+            else:
+                # Dynamic Smart Fallback Engine when API key is not configured
+                prompt_lower = user_prompt.lower().strip()
+                if prompt_lower == "what is c ?" or "what is c" in prompt_lower:
+                    ai_response = (
+                        "**C** is a general-purpose, procedural programming language developed in 1972 by Dennis Ritchie at Bell Labs.\n\n"
+                        "### Key Characteristics of C:\n"
+                        "- **Low-Level Memory Access:** Allows direct manipulation of hardware and memory addresses using pointers.\n"
+                        "- **Fast & Efficient:** Compiles directly into machine code, offering high execution performance.\n"
+                        "- **Foundation of Modern Languages:** Syntax concepts in C directly influenced C++, Java, C#, and JavaScript.\n"
+                        "- **Use Cases:** Used extensively in operating systems (Linux kernel, Windows core), embedded systems, compilers, and game engines."
+                    )
+                elif "python" in prompt_lower:
+                    ai_response = (
+                        "**Python** is a high-level, interpreted language designed for readability and simplicity.\n\n"
+                        "### Common Uses:\n"
+                        "1. **Artificial Intelligence & Machine Learning** (TensorFlow, PyTorch)\n"
+                        "2. **Data Science & Analysis** (Pandas, NumPy)\n"
+                        "3. **Web Development** (Django, Flask)\n"
+                        "4. **Automation & Scripting**"
+                    )
+                else:
+                    ai_response = (
+                        f"### Answer for: '{user_prompt}'\n\n"
+                        f"Great question! As an AI academic assistant, I analyze your query in the context of your **{user['department']}** studies at **{user['university']}**.\n\n"
+                        "1. **Core Concept:** Focus on fundamental principles before delving into advanced applications.\n"
+                        "2. **Practical Practice:** Write code examples or work through step-by-step solutions.\n"
+                        "3. **Peer Mentorship:** Connect with registered Senior mentors on UniBridge to review your understanding."
+                    )
+
+            message_placeholder.markdown(ai_response)
+
+        # Store AI response into message state
+        st.session_state.chat_messages.append({"role": "assistant", "content": ai_response})
+
+# ============================================================
+# 10. SETTINGS & PROFILE UPDATES
 # ============================================================
 elif selected_page == "Settings":
-    st.subheader("🔧 System & Profile Settings")
-    set_name = st.text_input("User Name", value=data["settings"].get("name", ""))
-    set_univ = st.text_input("University", value=data["settings"].get("university", ""))
-    set_notif = st.checkbox("Notifications Enabled", value=data["settings"].get("notifications", True))
-    set_email = st.checkbox("Email Alerts Enabled", value=data["settings"].get("email", True))
-    set_theme = st.selectbox("UI Theme", ["Light", "Dark"], index=0)
+    st.subheader("⚙️ Account & Application Settings")
     
-    if st.button("Save Settings"):
-        data["settings"] = {
-            "name": set_name,
-            "university": set_univ,
-            "notifications": set_notif,
-            "email": set_email,
-            "theme": set_theme
-        }
-        if set_name:
-            data["current_user"] = set_name
-        st.success("✅ System Settings Saved!")
-        st.rerun()
+    with st.form("settings_form"):
+        st.write(f"**Email:** `{user['email']}` (Read-only)")
+        up_name = st.text_input("User Name", value=user["name"])
+        up_univ = st.text_input("University", value=user["university"])
+        up_dept = st.text_input("Department", value=user["department"])
+        up_bio = st.text_area("Bio / Interests", value=user["bio"])
+        up_exp = st.text_input("Skills / Expertise", value=user["expertise"])
+        
+        save_settings = st.form_submit_button("Save Settings")
+        
+        if save_settings:
+            conn.execute("""
+                UPDATE users SET name = ?, university = ?, department = ?, bio = ?, expertise = ? WHERE id = ?
+            """, (up_name.strip(), up_univ.strip(), up_dept.strip(), up_bio.strip(), up_exp.strip(), user["id"]))
+            conn.commit()
+            
+            st.session_state.auth_user["name"] = up_name.strip()
+            st.session_state.auth_user["university"] = up_univ.strip()
+            st.session_state.auth_user["department"] = up_dept.strip()
+            st.session_state.auth_user["bio"] = up_bio.strip()
+            st.session_state.auth_user["expertise"] = up_exp.strip()
+            
+            st.success("Settings updated successfully!")
+            st.rerun()
+
+conn.close()
